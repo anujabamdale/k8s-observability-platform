@@ -1,96 +1,115 @@
-# MLOps Churn Prediction Pipeline
+# Kubernetes Observability & Autoscaling Platform
 
-An end-to-end MLOps pipeline: training with experiment tracking, model serving via API,
-automated drift detection, and a CI/CD pipeline that gates deployment on model quality.
-
-Most portfolio ML projects stop at a notebook that trains a model. This project focuses
-on everything *around* the model that makes it operable in production: versioning,
-serving, monitoring, and automated retraining triggers.
+A FastAPI service deployed on Kubernetes with full observability (Prometheus + Grafana),
+autoscaling under real load (HPA), and reliability guarantees (PDB, health probes) —
+plus a load test designed specifically to trigger the autoscaler, not just configure it.
 
 ## Architecture
 
 ```
-                     ┌─────────────────┐
-  generate_data.py → │  train.py        │ → logs params/metrics/model → MLflow
-                     │  (quality gate)  │ → saves model.joblib + baseline_stats.json
-                     └─────────────────┘
-                              │
-                              ▼
-                     ┌─────────────────┐
-                     │  serve.py         │ → FastAPI /predict, /health, /ready
-                     │  (Docker)        │
-                     └─────────────────┘
-                              │
-                     new production data
-                              ▼
-                     ┌─────────────────┐
-                     │ monitor_drift.py │ → KS-test + PSI vs. training baseline
-                     │                  │ → non-zero exit on drift → triggers retrain
-                     └─────────────────┘
-
-  All of the above wired together in .github/workflows/ci-cd.yml
+                     ┌───────────────────────────────┐
+   locustfile.py  →  │  order-service (2-8 pods)      │
+   (load test)       │  FastAPI + /metrics endpoint   │
+                     └───────────────────────────────┘
+                          │scraped by         │HPA watches
+                          ▼                    ▼
+                     ┌──────────┐        ┌─────────────┐
+                     │Prometheus │◄──────►│ CPU metrics  │
+                     │+ alerts  │        │ → scale 2-8  │
+                     └──────────┘        └─────────────┘
+                          │
+                          ▼
+                     ┌──────────┐
+                     │ Grafana   │  (dashboards: RPS, error %, p50/p95/p99, in-flight)
+                     └──────────┘
 ```
 
 ## Why these design choices (interview talking points)
 
-- **MLflow over ad-hoc logging** — gives comparable runs, a model registry, and a
-  standard artifact format `serve.py` can load without knowing training internals.
-- **A hard quality gate in `train.py`** (`--min_roc_auc`) — a model that doesn't clear
-  the bar fails the CI build instead of silently deploying a worse model.
-- **KS-test + PSI for drift, not just mean/std comparison** — distribution *shape*
-  can shift while the mean stays flat (e.g. a spread-out vs. bimodal distribution).
-  KS catches that; comparing summary statistics alone would miss it.
-- **`/health` vs `/ready` are separate endpoints** — a Kubernetes liveness probe
-  shouldn't depend on model-loading logic. If model loading is slow, the process
-  is still "alive" — it's just not ready to serve yet. Conflating the two causes
-  orchestrators to kill and restart healthy-but-slow-starting pods.
-- **`model.joblib` saved alongside MLflow tracking** — the serving container
-  doesn't need a live MLflow tracking server at inference time, which would be a
-  single point of failure for every prediction request.
-- **Synthetic data generation instead of a downloaded dataset** — keeps the repo
-  self-contained and license-free, and lets the drift demo be deterministic
-  (`generate(..., drift=True)` produces a known, reproducible shift to validate
-  the monitor actually works, rather than hoping a real dataset drifts).
+- **HPA scales on CPU%, with resource `requests`/`limits` set explicitly** —
+  CPU-percentage autoscaling is meaningless without a request value as the
+  denominator. This is a common misconfiguration in real clusters: an HPA
+  target with no resource requests set silently never triggers.
+- **Asymmetric scale-up/scale-down behavior** — scale up fast (30s stabilization,
+  +100%/30s) to absorb traffic spikes, but scale down slowly (120s stabilization,
+  -25%/60s) to avoid flapping — repeatedly scaling down then back up, which
+  wastes resources on pod churn and can drop requests during the transition.
+- **`/health` vs `/ready` are separate endpoints** — liveness shouldn't depend on
+  downstream dependencies. If `/ready` checked a database and the DB blipped,
+  a liveness probe reusing that same check would kill and restart a perfectly
+  healthy process, adding a restart storm on top of an already-degraded dependency.
+- **PodDisruptionBudget (`minAvailable: 1`)** — without this, a node drain during
+  a cluster upgrade could evict all replicas at once. This turns "I have 2 replicas"
+  into an actual availability guarantee during maintenance operations.
+- **Alerting on p95 latency and error *rate*, not averages or raw counts** —
+  average latency hides a slow tail that still affects real users; an absolute
+  error count either never fires (low traffic) or always fires (high traffic).
+  A ratio-based, percentile-based approach scales correctly with traffic volume.
+- **A dedicated `/cpu-intensive` endpoint + `CPUStressUser` load-test class** —
+  built specifically so the HPA can be exercised and observed scaling live,
+  rather than just existing as unverified YAML.
 
-## Local setup
-
-```bash
-pip install -r requirements.txt
-python src/generate_data.py          # creates data/train.csv + two test batches
-python src/train.py                  # trains, logs to ./mlruns, saves models/model.joblib
-python src/monitor_drift.py --batch_path data/fresh_batch.csv     # should pass
-python src/monitor_drift.py --batch_path data/drifted_batch.csv   # should flag drift
-pytest tests/ -v
-```
-
-Run the API locally:
-```bash
-uvicorn src.serve:app --reload
-curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d '{
-  "tenure_months": 5, "monthly_charge": 95.0, "support_calls": 4,
-  "plan_type": "basic", "contract_months": 1
-}'
-```
-
-## Run the full stack with Docker Compose
+## Run it locally (docker-compose)
 
 ```bash
-python src/generate_data.py && python src/train.py   # produces models/ artifacts first
 docker compose up --build
 ```
-- API: http://localhost:8000/docs (interactive Swagger UI)
-- MLflow UI: http://localhost:5000
+- App: http://localhost:8000/docs
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (anonymous viewer access enabled; admin/admin for editing)
+  — the "Order Service Overview" dashboard is auto-provisioned.
 
-## CI/CD pipeline (`.github/workflows/ci-cd.yml`)
+Generate traffic:
+```bash
+pip install locust
+locust -f loadtest/locustfile.py --host http://localhost:8000
+# open http://localhost:8089, set users=50, spawn rate=5, and start
+```
+Watch the Grafana dashboard update live as load ramps up.
 
-On every push: generates data → runs unit tests → trains the model (fails the build
-if it doesn't clear the ROC-AUC quality gate) → runs API tests against the freshly
-trained model → builds the Docker image. A separate scheduled job simulates a nightly
-drift check against fresh production-like data.
+## Deploy to a real Kubernetes cluster (minikube / kind / EKS / GKE)
+
+```bash
+# Build and load the image (for minikube):
+docker build -t order-service:latest ./app
+minikube image load order-service:latest
+
+# Apply manifests in order:
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/01-configmap.yaml
+kubectl apply -f k8s/02-deployment.yaml
+kubectl apply -f k8s/03-hpa.yaml
+kubectl apply -f k8s/04-pdb.yaml
+
+# Watch pods and HPA:
+kubectl get pods -n order-service -w
+kubectl get hpa -n order-service -w
+```
+
+Port-forward and load test against the real cluster to watch it scale:
+```bash
+kubectl port-forward -n order-service svc/order-service 8000:80
+locust -f loadtest/locustfile.py --host http://localhost:8000 --headless -u 100 -r 10 --run-time 5m
+# in another terminal: kubectl get hpa -n order-service -w
+```
+
+You should see `REPLICAS` climb from 2 toward 8 as CPU utilization crosses 70%,
+then slowly settle back down ~2 minutes after load stops.
+
+## Metrics exposed (`/metrics`)
+
+| Metric | Type | Purpose |
+|---|---|---|
+| `order_service_requests_total` | Counter | RPS, error rate, per-endpoint breakdown |
+| `order_service_request_latency_seconds` | Histogram | p50/p95/p99 latency |
+| `order_service_in_progress_requests` | Gauge | Current concurrency |
+| `order_service_orders_created_total` | Counter | Business metric, not just infra |
+| `order_service_order_failures_total` | Counter | Failure reason breakdown |
 
 ## What I'd add with more time
 
-- Real feature store instead of CSV snapshots
-- Push the Docker image to a real registry (GHCR/ECR) and auto-deploy to a k8s cluster
-- Wire the drift-detected exit code to actually trigger a `workflow_dispatch` retraining run
-- A/B or shadow-deployment logic for comparing a new model against the current production model
+- Real `kube-prometheus-stack` Helm install + `ServiceMonitor` CRD instead of pod annotations
+- Alertmanager wired to Slack/PagerDuty for the alert rules already defined
+- A chaos experiment (e.g., Chaos Mesh pod-kill) to validate the PDB and readiness
+  probes actually protect availability, not just that they're configured
+- Multi-AZ node affinity/anti-affinity rules so replicas spread across failure domains
