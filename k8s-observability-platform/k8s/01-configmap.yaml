@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-config
+  namespace: order-service
+data:
+  # Externalized so failure rate can be tuned without rebuilding the image —
+  # e.g. bump it up temporarily to test alerting rules against a real signal.
+  SIMULATED_FAILURE_RATE: "0.05"

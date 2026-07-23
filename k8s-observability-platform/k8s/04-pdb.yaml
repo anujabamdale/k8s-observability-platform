@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service-pdb
+  namespace: order-service
+spec:
+  # Ensures voluntary disruptions (node drains, cluster upgrades) never take
+  # down more than 1 pod at a time — without this, a rolling node upgrade
+  # could evict every replica simultaneously and cause a real outage.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: order-service

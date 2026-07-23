@@ -1,0 +1,43 @@
+groups:
+  - name: order-service-alerts
+    rules:
+      # Error-rate alert uses a ratio over a 5-minute window rather than an
+      # absolute count — an absolute-count threshold either fires constantly
+      # at high traffic or never fires at low traffic. Ratio-based scales
+      # with actual traffic volume.
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(order_service_requests_total{status_code=~"5.."}[5m]))
+            /
+            sum(rate(order_service_requests_total[5m]))
+          ) > 0.10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order service error rate above 10%"
+          description: "More than 10% of requests have returned 5xx over the last 5 minutes."
+
+      # p95 latency, not average — average hides a slow tail that still
+      # affects a meaningful fraction of real users.
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(order_service_request_latency_seconds_bucket[5m])) by (le, endpoint)
+          ) > 1.0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 1s on {{ $labels.endpoint }}"
+          description: "95th percentile request latency has exceeded 1 second for 3+ minutes."
+
+      - alert: PodRestartingFrequently
+        expr: rate(kube_pod_container_status_restarts_total{namespace="order-service"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "order-service pod restarting repeatedly"
+          description: "This usually indicates a crash loop — check logs immediately."
